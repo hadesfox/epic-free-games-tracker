@@ -1893,6 +1893,8 @@ var STEAM_IDS = {
 // IMAGE LOADING
 // ============================================================
 var steamIdCache = {};
+var epicImageCache = {};
+
 var pendingLookups = {};
 var lookupQueue = [];
 
@@ -2082,8 +2084,11 @@ function renderGames() {
       var cachedId = steamIdCache[lookupKey];
       var imgContent = '';
       var steamData = STEAM_IDS[lookupKey];
+      var epicImg = epicImageCache[lookupKey];
       if (steamData && steamData.header) {
         imgContent = '<img src="' + steamData.header + '" alt="' + g.name + '" loading="lazy">';
+      } else if (epicImg) {
+        imgContent = '<img src="' + epicImg + '" alt="' + g.name + '" loading="lazy">';
       } else {
         imgContent = '<div class="card-image-placeholder">' + g.nameCn.charAt(0) + '</div>';
       }
@@ -2133,6 +2138,99 @@ var CORS_PROXIES = [
   'https://api.allorigins.win/raw?url=',
   'https://api.codetabs.com/v1/proxy?quest='
 ];
+// ============================================================
+// LOCAL STORAGE PERSISTENCE
+// ============================================================
+var STORAGE_KEY_GAMES = 'epic_free_games_data';
+var STORAGE_KEY_CN = 'epic_free_games_cn';
+var STORAGE_KEY_STEAM = 'epic_free_games_steam';
+var STORAGE_KEY_IMAGES = 'epic_free_games_images';
+
+function saveAllToStorage() {
+  try {
+    // Save merged GAMES array
+    localStorage.setItem(STORAGE_KEY_GAMES, JSON.stringify(GAMES));
+    // Save extended CN names (baked-in + newly looked up)
+    localStorage.setItem(STORAGE_KEY_CN, JSON.stringify(CN));
+    // Save extended STEAM_IDS (baked-in + newly looked up)
+    localStorage.setItem(STORAGE_KEY_STEAM, JSON.stringify(STEAM_IDS));
+    // Save Epic image URLs per game
+    localStorage.setItem(STORAGE_KEY_IMAGES, JSON.stringify(epicImageCache));
+    return true;
+  } catch(e) {
+    console.warn('localStorage save failed:', e.message);
+    return false;
+  }
+}
+
+function loadFromStorage() {
+  try {
+    var savedGames = localStorage.getItem(STORAGE_KEY_GAMES);
+    var savedCN = localStorage.getItem(STORAGE_KEY_CN);
+    var savedSteam = localStorage.getItem(STORAGE_KEY_STEAM);
+    var savedImages = localStorage.getItem(STORAGE_KEY_IMAGES);
+
+    if (!savedGames) return false;
+
+    var storageGames = JSON.parse(savedGames);
+    if (!storageGames || !storageGames.length) return false;
+
+    // Merge storage games into baked-in GAMES (union by name+start)
+    var existingKeys = {};
+    GAMES.forEach(function(g) {
+      existingKeys[g.name.toLowerCase().trim() + '_' + g.start] = true;
+    });
+
+    var addedCount = 0;
+    storageGames.forEach(function(g) {
+      var key = g.name.toLowerCase().trim() + '_' + g.start;
+      if (!existingKeys[key]) {
+        GAMES.push(g);
+        addedCount++;
+      }
+    });
+
+    // Merge CN names
+    if (savedCN) {
+      try {
+        var storageCN = JSON.parse(savedCN);
+        Object.keys(storageCN).forEach(function(k) {
+          if (!CN[k]) CN[k] = storageCN[k];
+        });
+      } catch(e) {}
+    }
+
+    // Merge STEAM_IDS
+    if (savedSteam) {
+      try {
+        var storageSteam = JSON.parse(savedSteam);
+        Object.keys(storageSteam).forEach(function(k) {
+          if (!STEAM_IDS[k]) STEAM_IDS[k] = storageSteam[k];
+        });
+      } catch(e) {}
+    }
+
+    // Merge Epic images
+    if (savedImages) {
+      try {
+        var storageImages = JSON.parse(savedImages);
+        Object.keys(storageImages).forEach(function(k) {
+          if (!epicImageCache[k]) epicImageCache[k] = storageImages[k];
+        });
+      } catch(e) {}
+    }
+
+    if (addedCount > 0) {
+      rebuildProcessedGames();
+      console.log('Loaded ' + addedCount + ' games from localStorage (total: ' + GAMES.length + ')');
+    }
+    return addedCount > 0;
+  } catch(e) {
+    console.warn('localStorage load failed:', e.message);
+    return false;
+  }
+}
+
 
 function fetchLatestGames() {
   var btn = document.getElementById('btnRefresh');
@@ -2182,24 +2280,60 @@ function processEpicData(data) {
       var promos = el.promotions;
       if (!promos) return;
 
-      // 取当前促销或即将促销的免费赠送
+      // Epic official image (keyImages)
+      var epicImg = null;
+      if (el.keyImages && el.keyImages.length > 0) {
+        // Prefer OfferImageWide or DieselStoreFrontWide
+        for (var i = 0; i < el.keyImages.length; i++) {
+          var ki = el.keyImages[i];
+          if (ki.type === 'DieselStoreFrontWide' || ki.type === 'OfferImageWide') {
+            epicImg = ki.url;
+            break;
+          }
+        }
+        if (!epicImg) {
+          // Fallback to first image
+          epicImg = el.keyImages[0].url;
+        }
+      }
+
+      // Chinese name (from locale=zh-CN response)
+      var nameCn = el.title || null;
+      // English name from productSlug or catalogNs mappings
+      var nameEn = el.title;
+      if (el.catalogNs && el.catalogNs.mappings && el.catalogNs.mappings.length > 0) {
+        nameEn = el.catalogNs.mappings[0].title || el.title;
+      }
+      // Use productSlug for English name if available and looks better
+      if (el.productSlug) {
+        // Convert slug to readable name (fallback)
+        var slugName = el.productSlug.replace(/-/g, ' ').replace(/\//g, ' ')
+          .replace(/\b\w/g, function(ch) { return ch.toUpperCase(); });
+      }
+
       var offerGroups = (promos.promotionalOffers || []).concat(promos.upcomingPromotionalOffers || []);
       offerGroups.forEach(function(group) {
         (group.promotionalOffers || []).forEach(function(offer) {
           var disc = offer.discountSetting;
-          if (!disc || disc.discountPercentage !== 0) return; // 只要 100% 折扣
+          if (!disc || disc.discountPercentage !== 0) return;
 
           var startDate = offer.startDate ? offer.startDate.replace('Z','').split('.')[0] : null;
           var endDate = offer.endDate ? offer.endDate.replace('Z','').split('.')[0] : null;
           if (!startDate || !endDate) return;
 
-          var start = startDate.slice(0, 10); // YYYY-MM-DD
+          var start = startDate.slice(0, 10);
           var end = endDate.slice(0, 10);
 
-          var name = el.title;
-          if (!name || name === 'Mystery Game') return; // 跳过神秘游戏
+          var name = nameEn;
+          if (!name || name === 'Mystery Game') return;
 
-          newGames.push({ name: name, start: start, end: end });
+          newGames.push({
+            name: name,
+            start: start,
+            end: end,
+            nameCn: nameCn || name,
+            epicImage: epicImg
+          });
         });
       });
     });
@@ -2209,32 +2343,50 @@ function processEpicData(data) {
       return;
     }
 
-    // 与现有 GAMES 对比，找出新记录
+    // Deduplicate against existing GAMES
     var existingKeys = {};
     GAMES.forEach(function(g) {
       existingKeys[g.name.toLowerCase().trim() + '_' + g.start] = true;
     });
 
-    var added = 0;
+    var added = [];
     newGames.forEach(function(g) {
       var key = g.name.toLowerCase().trim() + '_' + g.start;
       if (!existingKeys[key]) {
-        GAMES.push(g);
-        added++;
+        GAMES.push({name: g.name, start: g.start, end: g.end});
+
+        // Store Chinese name
+        var lowerName = g.name.toLowerCase().trim();
+        if (g.nameCn && g.nameCn !== g.name && !CN[lowerName]) {
+          CN[lowerName] = g.nameCn;
+        }
+
+        // Store Epic image
+        if (g.epicImage) {
+          epicImageCache[lowerName] = g.epicImage;
+        }
+
+        added.push(g);
       }
     });
 
-    if (added > 0) {
-      // 重新处理数据并更新视图
-      rebuildProcessedGames();
-      setView(currentView);
+    if (added.length > 0) {
+      // Save to localStorage immediately
+      saveAllToStorage();
 
-      // 更新底部时间显示
-      var nowStr = now.getFullYear() + ' 年 ' + (now.getMonth()+1) + ' 月 ' + now.getDate() + ' 日 ' + String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
-      var el = document.getElementById('lastUpdateTime');
-      if (el) el.textContent = '最后更新：' + nowStr;
+      // Then look up Steam IDs for new games
+      lookupSteamIdsForNew(added, function() {
+        // After Steam lookup, save again with Steam data
+        saveAllToStorage();
+        rebuildProcessedGames();
+        setView(currentView);
 
-      onRefreshDone(added, '新增 ' + added + ' 条记录！');
+        var nowStr = now.getFullYear() + ' 年 ' + (now.getMonth()+1) + ' 月 ' + now.getDate() + ' 日 ' + String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
+        var el = document.getElementById('lastUpdateTime');
+        if (el) el.textContent = '最后更新：' + nowStr;
+
+        onRefreshDone(added.length, '新增 ' + added.length + ' 条记录！');
+      });
     } else {
       onRefreshDone(0, '数据已是最新');
     }
@@ -2242,6 +2394,61 @@ function processEpicData(data) {
     onRefreshError('解析数据失败：' + e.message);
   }
 }
+
+// ============================================================
+// STEAM ID LOOKUP FOR NEW GAMES (via CORS proxy)
+// ============================================================
+function lookupSteamIdsForNew(newGames, callback) {
+  var pending = newGames.length;
+  if (pending === 0) { callback(); return; }
+
+  var steamStoreProxy = CORS_PROXIES[0]; // Use first proxy
+
+  newGames.forEach(function(g) {
+    var lowerName = g.name.toLowerCase().trim();
+    // Skip if already in STEAM_IDS
+    if (STEAM_IDS[lowerName]) {
+      pending--;
+      if (pending === 0) callback();
+      return;
+    }
+
+    var searchUrl = steamStoreProxy + encodeURIComponent(
+      'https://store.steampowered.com/api/storesearch/?term=' + encodeURIComponent(g.name) + '&l=en&cc=us'
+    );
+
+    fetch(searchUrl)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data && data.items && data.items.length > 0) {
+          var bestMatch = null;
+          // Find best match (exact or close)
+          for (var i = 0; i < data.items.length; i++) {
+            var item = data.items[i];
+            var itemName = (item.name || '').toLowerCase().trim();
+            if (itemName === lowerName || itemName.indexOf(lowerName) === 0 || lowerName.indexOf(itemName) === 0) {
+              bestMatch = item;
+              break;
+            }
+          }
+          if (!bestMatch) bestMatch = data.items[0];
+
+          var appId = String(bestMatch.id);
+          STEAM_IDS[lowerName] = {
+            steamId: appId,
+            header: 'https://cdn.cloudflare.steamstatic.com/steam/apps/' + appId + '/header.jpg'
+          };
+        }
+        pending--;
+        if (pending === 0) callback();
+      })
+      .catch(function() {
+        pending--;
+        if (pending === 0) callback();
+      });
+  });
+}
+
 
 function rebuildProcessedGames() {
   // 重新处理 GAMES 数组
@@ -2307,9 +2514,12 @@ function onRefreshError(msg) {
   }, 4000);
 }
 
-// Initial render
+// Initial render — load from localStorage first
+var loadedFromStorage = loadFromStorage();
+if (loadedFromStorage) {
+  rebuildProcessedGames();
+}
 setView('grid');
-renderGames();
 </script>
 
 </body>
